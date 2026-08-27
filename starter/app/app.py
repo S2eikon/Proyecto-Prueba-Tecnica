@@ -227,7 +227,12 @@ def registrar_pago(poliza_id):
             with conn.cursor() as cur:
 
                 # ------------------------------------------------------------
-                # Verificar si la Idempotency-Key ya fue utilizada
+                # Verificar si la Idempotency-Key ya fue utilizada.
+                #
+                # FOR UPDATE protege el registro si ya existe.
+                # Si dos solicitudes llegan simultáneamente y todavía no
+                # existe el registro, PostgreSQL resolverá la competencia
+                # mediante la restricción UNIQUE y ON CONFLICT.
                 # ------------------------------------------------------------
 
                 cur.execute(
@@ -317,40 +322,69 @@ def registrar_pago(poliza_id):
                     )
 
                 # ------------------------------------------------------------
-                # Registrar pago
+                # Registrar pago.
+                #
+                # ON CONFLICT evita que dos solicitudes concurrentes con
+                # la misma Idempotency-Key creen dos pagos.
                 # ------------------------------------------------------------
 
-                try:
-                    cur.execute(
-                        """
-                        INSERT INTO pagos (
-                            poliza_id,
-                            monto,
-                            referencia,
-                            estado,
-                            idempotency_key,
-                            fecha
-                        )
-                        VALUES (%s, %s, %s, 'pendiente', %s, %s)
-                        RETURNING id
-                        """,
-                        (
-                            poliza_id,
-                            monto,
-                            referencia,
-                            idempotency_key,
-                            datetime.now(timezone.utc),
-                        ),
+                cur.execute(
+                    """
+                    INSERT INTO pagos (
+                        poliza_id,
+                        monto,
+                        referencia,
+                        estado,
+                        idempotency_key,
+                        fecha
                     )
+                    VALUES (%s, %s, %s, 'pendiente', %s, %s)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        poliza_id,
+                        monto,
+                        referencia,
+                        idempotency_key,
+                        datetime.now(timezone.utc),
+                    ),
+                )
 
-                except Exception as exc:
-                    # La restricción UNIQUE de la BD es la última garantía
-                    # contra solicitudes concurrentes.
-                    conn.rollback()
+                resultado_insert = cur.fetchone()
 
-                    log.warning(
-                        "Error al registrar pago: %s",
-                        exc,
+                if resultado_insert is not None:
+                    pago_id = resultado_insert[0]
+
+                    return jsonify(
+                        {
+                            "pago_id": pago_id,
+                            "estado": "pendiente",
+                        }
+                    ), 201
+
+                # ------------------------------------------------------------
+                # La llave fue insertada concurrentemente por otra solicitud.
+                # Recuperamos el pago creado por la otra transacción.
+                # ------------------------------------------------------------
+
+                cur.execute(
+                    """
+                    SELECT id, poliza_id, monto, referencia, estado
+                    FROM pagos
+                    WHERE idempotency_key = %s
+                    FOR UPDATE
+                    """,
+                    (idempotency_key,),
+                )
+
+                pago_existente = cur.fetchone()
+
+                if pago_existente is None:
+                    log.error(
+                        "No fue posible recuperar el pago para "
+                        "Idempotency-Key=%s",
+                        idempotency_key,
                     )
 
                     return error_response(
@@ -358,14 +392,33 @@ def registrar_pago(poliza_id):
                         500,
                     )
 
-                pago_id = cur.fetchone()[0]
+                (
+                    pago_id,
+                    pago_poliza_id,
+                    pago_monto,
+                    pago_referencia,
+                    pago_estado,
+                ) = pago_existente
+
+                # Verificar que la solicitud concurrente tenga exactamente
+                # los mismos datos.
+                if (
+                    pago_poliza_id != poliza_id
+                    or pago_monto != monto
+                    or pago_referencia != referencia
+                ):
+                    return error_response(
+                        "El Idempotency-Key ya fue utilizada "
+                        "con datos diferentes",
+                        409,
+                    )
 
                 return jsonify(
                     {
                         "pago_id": pago_id,
-                        "estado": "pendiente",
+                        "estado": pago_estado,
                     }
-                ), 201
+                ), 200
 
     except Exception as exc:
         log.exception(
@@ -393,11 +446,9 @@ def webhook():
     """
     Procesa webhooks de la pasarela de forma idempotente.
 
-    La combinación de:
-
-        webhook_eventos.event_id UNIQUE
-
-    y una única transacción evita procesar dos veces el mismo evento.
+    La restricción UNIQUE sobre event_id y ON CONFLICT permiten
+    manejar correctamente webhooks duplicados incluso cuando
+    llegan simultáneamente.
     """
 
     payload = get_json_body()
@@ -472,7 +523,7 @@ def webhook():
             with conn.cursor() as cur:
 
                 # ------------------------------------------------------------
-                # Verificar si el evento ya fue procesado
+                # Verificar si el evento ya fue procesado.
                 # ------------------------------------------------------------
 
                 cur.execute(
@@ -480,6 +531,7 @@ def webhook():
                     SELECT id
                     FROM webhook_eventos
                     WHERE event_id = %s
+                    FOR UPDATE
                     """,
                     (event_id,),
                 )
@@ -519,7 +571,10 @@ def webhook():
                 _, poliza_id, estado_actual = pago
 
                 # ------------------------------------------------------------
-                # Registrar evento
+                # Registrar evento de forma idempotente.
+                #
+                # Si otro request insertó el mismo event_id
+                # concurrentemente, ON CONFLICT no crea un segundo evento.
                 # ------------------------------------------------------------
 
                 cur.execute(
@@ -531,6 +586,8 @@ def webhook():
                         recibido_at
                     )
                     VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (event_id) DO NOTHING
+                    RETURNING id
                     """,
                     (
                         event_id,
@@ -539,6 +596,17 @@ def webhook():
                         datetime.now(timezone.utc),
                     ),
                 )
+
+                evento_insertado = cur.fetchone()
+
+                if evento_insertado is None:
+                    # Otro proceso ganó la carrera y registró el evento.
+                    return jsonify(
+                        {
+                            "ok": True,
+                            "duplicate": True,
+                        }
+                    ), 200
 
                 # ------------------------------------------------------------
                 # Actualizar pago

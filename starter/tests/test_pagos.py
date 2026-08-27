@@ -7,6 +7,7 @@ APP_DIR = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP_DIR))
 
 from app import app
+from db import get_connection
 
 
 @pytest.fixture
@@ -138,3 +139,89 @@ def test_poliza_inexistente(client):
     assert response.get_json() == {
         "error": "poliza no encontrada"
     }
+
+
+def test_pago_idempotente(client):
+    """
+    Verifica que dos requests con la misma Idempotency-Key
+    y el mismo cuerpo crean un solo pago en PostgreSQL.
+    """
+
+    idempotency_key = "test-idempotencia-real-001"
+
+    payload = {
+        "monto": 1000.00,
+        "referencia": "REF-IDEMPOTENCIA-001",
+    }
+
+    try:
+        # Primera solicitud
+        response_1 = client.post(
+            "/polizas/1/pagos",
+            headers={
+                "Idempotency-Key": idempotency_key,
+            },
+            json=payload,
+        )
+
+        assert response_1.status_code == 201
+
+        pago_1 = response_1.get_json()
+
+        assert "pago_id" in pago_1
+        assert pago_1["estado"] == "pendiente"
+
+        # Segunda solicitud con la misma llave y los mismos datos
+        response_2 = client.post(
+            "/polizas/1/pagos",
+            headers={
+                "Idempotency-Key": idempotency_key,
+            },
+            json=payload,
+        )
+
+        assert response_2.status_code == 200
+
+        pago_2 = response_2.get_json()
+
+        assert pago_2["pago_id"] == pago_1["pago_id"]
+        assert pago_2["estado"] == "pendiente"
+
+        # Verificar directamente en PostgreSQL que existe un solo pago
+        conn = get_connection()
+
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM pagos
+                        WHERE idempotency_key = %s
+                        """,
+                        (idempotency_key,),
+                    )
+
+                    cantidad = cur.fetchone()[0]
+
+                    assert cantidad == 1
+
+        finally:
+            conn.close()
+
+    finally:
+        # Limpiar el pago creado por la prueba
+        conn = get_connection()
+
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM pagos
+                        WHERE idempotency_key = %s
+                        """,
+                        (idempotency_key,),
+                    )
+        finally:
+            conn.close()
